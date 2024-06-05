@@ -24,7 +24,7 @@ func (s *Server) handleWS(ws *websocket.Conn) {
 	log.Println("new connection has been caught :", ws.RemoteAddr())
 	s.conns[ws] = true
 
-
+	s.readLoop(ws)
 }
 
 func (s *Server) readLoop(ws *websocket.Conn) {
