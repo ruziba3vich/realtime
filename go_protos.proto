@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+option go_package = "github.com/ruziba3vich/realtime/genproto";
+
+
+service MessageService {
+  rpc SendMessage (MessageRequest) returns (MessageResponse);
+}
+
+message MessageRequest {
+  string from = 1;
+  string to = 2;
+  string message = 3;
+}
+
+message MessageResponse {
+  string status = 1;
+}

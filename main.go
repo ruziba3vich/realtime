@@ -1,44 +1,111 @@
 package main
 
 import (
-	"io"
+	"context"
 	"log"
+	"net"
 	"net/http"
+	"sync"
 
-	"golang.org/x/net/websocket"
+	pb "github.com/ruziba3vich/realtime/genproto"
+
+	"github.com/gorilla/websocket"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
 )
 
-type (
-	Server struct {
-		conns map[*websocket.Conn]bool
-	}
-)
+type User struct {
+	ID   string
+	Conn *websocket.Conn
+}
+
+type Server struct {
+	Users map[string]*User
+	Mutex sync.Mutex
+	pb.UnimplementedMessageServiceServer
+}
 
 func NewServer() *Server {
 	return &Server{
-		conns: make(map[*websocket.Conn]bool),
+		Users: make(map[string]*User),
 	}
 }
 
-func (s *Server) handleWS(ws *websocket.Conn) {
-	log.Println("new connection has been caught :", ws.RemoteAddr())
-	s.conns[ws] = true
+func (s *Server) SendMessage(ctx context.Context, req *pb.MessageRequest) (*pb.MessageResponse, error) {
+	s.Mutex.Lock()
+	defer s.Mutex.Unlock()
 
-	s.readLoop(ws)
+	targetUser, exists := s.Users[req.To]
+	if !exists {
+		return &pb.MessageResponse{Status: "User not found"}, nil
+	}
+
+	err := targetUser.Conn.WriteJSON(map[string]string{"from": req.From, "message": req.Message})
+	if err != nil {
+		return &pb.MessageResponse{Status: "Failed to send message"}, err
+	}
+	return &pb.MessageResponse{Status: "Message sent successfully"}, nil
 }
 
-func (s *Server) readLoop(ws *websocket.Conn) {
-	buf := make([]byte, 2048)
+func (s *Server) registerUserWebSocket(id string, conn *websocket.Conn) {
+	s.Mutex.Lock()
+	defer s.Mutex.Unlock()
+	s.Users[id] = &User{
+		ID:   id,
+		Conn: conn,
+	}
+}
+
+func (s *Server) removeUser(id string) {
+	s.Mutex.Lock()
+	defer s.Mutex.Unlock()
+	delete(s.Users, id)
+}
+
+func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		http.Error(w, "ID is required", http.StatusBadRequest)
+		return
+	}
+
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			return true
+		},
+	}
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Println("Upgrade error:", err)
+		return
+	}
+	defer conn.Close()
+
+	s.registerUserWebSocket(id, conn)
+	defer s.removeUser(id)
+
+	log.Println("New connection from:", id)
+
 	for {
-		n, err := ws.Read(buf)
+		var msg map[string]string
+		err := conn.ReadJSON(&msg)
 		if err != nil {
-			if err == io.EOF {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Println("Unexpected close error:", err)
+			}
+			break
+		}
+
+		targetID, message := msg["target"], msg["message"]
+		targetUser, exists := s.Users[targetID]
+		if exists {
+			err = targetUser.Conn.WriteJSON(map[string]string{"from": id, "message": message})
+			if err != nil {
+				log.Println("Write error:", err)
 				break
 			}
 		} else {
-			msg := buf[:n]
-			log.Println(string(msg))
-			ws.Write([]byte("thank you for the message"))
+			conn.WriteJSON(map[string]string{"error": "User not found"})
 		}
 	}
 }
@@ -46,6 +113,24 @@ func (s *Server) readLoop(ws *websocket.Conn) {
 func main() {
 	server := NewServer()
 
-	http.Handle("/ws", websocket.Handler(server.handleWS))
-	http.ListenAndServe(":2004", nil)
+	go func() {
+		listener, err := net.Listen("tcp", ":50051")
+		if err != nil {
+			log.Fatalf("Failed to listen on port 50051: %v", err)
+		}
+		grpcServer := grpc.NewServer()
+		pb.RegisterMessageServiceServer(grpcServer, server)
+		reflection.Register(grpcServer)
+
+		log.Println("Starting gRPC server on port :50051")
+		if err := grpcServer.Serve(listener); err != nil {
+			log.Fatalf("Failed to serve gRPC server: %v", err)
+		}
+	}()
+
+	http.HandleFunc("/ws", server.handleWS)
+	log.Println("Starting WebSocket server on :2004")
+	if err := http.ListenAndServe(":2004", nil); err != nil {
+		log.Fatal(err)
+	}
 }
